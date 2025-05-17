@@ -1,0 +1,59 @@
+body,
+html {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  font-family: sans-serif;
+}
+
+#browser {
+  width: 100%;
+  height: calc(100% - 50px);
+  border: none;
+}
+
+#urlForm {
+  display: flex;
+  height: 50px;
+  background: #eee;
+  padding: 5px;
+  box-sizing: border-box;
+}
+
+#urlInput {
+  flex: 1;
+  padding: 10px;
+  font-size: 16px;
+}
+
+#goButton {
+  padding: 10px 20px;
+  font-size: 16px;
+}
+
+#paywall {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(200, 0, 0, 0.9);
+  color: white;
+  font-size: 2rem;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  flex-direction: column;
+  z-index: 9999;
+  display: none;
+}
+
+#paywall.locked {
+  display: flex;
+}
+
+.lock-icon {
+  font-size: 5rem;
+  margin-bottom: 20px;
+}

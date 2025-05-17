@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Volume Zero Navegador</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="urlForm">
+      <input
+        type="text"
+        id="urlInput"
+        placeholder="Digite a URL (ex: https://example.com)"
+      />
+      <button id="goButton">Abrir</button>
+    </div>
+
+    <iframe id="browser" src=""></iframe>
+
+    <div id="paywall">
+      <div class="lock-icon">🔒</div>
+      <div>Sistema bloqueado</div>
+    </div>
+
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <script src="script.js"></script>
+  </body>
+</html>
