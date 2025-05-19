@@ -38,6 +38,7 @@ pico_sdk_init()
 add_executable(volume-zero
         src/main.c
         src/ssd1306_i2c.c
+        src/ws2818b.pio
 )
 
 pico_set_program_name(volume-zero "volume-zero")
@@ -46,6 +47,11 @@ pico_set_program_version(volume-zero "0.1")
 # Modify the below lines to enable/disable output over UART/USB
 pico_enable_stdio_uart(volume-zero 0)
 pico_enable_stdio_usb(volume-zero 1)
+
+# Generate pio header
+pico_generate_pio_header(volume-zero
+    ${CMAKE_CURRENT_LIST_DIR}/src/ws2818b.pio
+)
 
 # Add the standard library to the build
 target_link_libraries(volume-zero
@@ -58,9 +64,9 @@ target_include_directories(volume-zero PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/include
 )
 
+
 # Add any user requested libraries
-target_link_libraries(
-        volume-zero
+target_link_libraries(volume-zero
         pico_stdlib
         pico_cyw43_arch_lwip_threadsafe_background
         pico_lwip_mqtt

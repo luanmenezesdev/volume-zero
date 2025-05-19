@@ -7,13 +7,39 @@
 #include "ssd1306.h"
 #include "hardware/i2c.h"
 #include "hardware/adc.h"
+#include "hardware/pio.h"
+#include "ws2818b.pio.h"
 #include "pico/cyw43_arch.h"
 #include "lwip/apps/mqtt.h"
 #include "lwip/ip_addr.h"
 
+// App Mode
+typedef enum
+{
+    MODE_LISTENING,
+    MODE_CHALLENGE
+} app_mode_t;
+
+volatile app_mode_t current_mode = MODE_LISTENING;
+
+// Led Matrix Configuration
+#define WS_PIN 7
+#define MAX_LEVELS 10
+#define MATRIX_SIDE 5
+#define MATRIX_LEDS 25
+#define MID_IDX 12
+uint8_t global_brightness = 64;
+
+uint8_t level = 1;
+static uint64_t last_reset_ms = 0;
+bool led_on[MATRIX_LEDS];
+uint8_t cursor_idx = MID_IDX;
+
 // Wi-Fi Credentials
-#define WIFI_SSID "brisa-4370576"
-#define WIFI_PASSWORD "mmy6opmr"
+// #define WIFI_SSID "brisa-4370576"
+// #define WIFI_PASSWORD "mmy6opmr"
+#define WIFI_SSID "Redmi Note 12"
+#define WIFI_PASSWORD "luanteste"
 
 // MQTT Configuration
 #define MQTT_BROKER "52.28.107.34"
@@ -21,7 +47,7 @@
 #define MQTT_TOPIC_CLEAR "volume/clear"
 
 // Microphone Configuration
-#define INFRACTION_SEND_COOLDOWN_MS 3000
+#define INFRACTION_SEND_COOLDOWN_MS 15000
 #define MIC_THRESHOLD 2100
 #define REQUIRED_PEAKS 5
 #define WINDOW_MS 10000
@@ -39,7 +65,6 @@ uint64_t last_peak_time = 0;
 // LED and Button Pins
 #define LED_R_PIN 13
 #define LED_G_PIN 11
-#define BTN_A_PIN 5
 #define BTN_B_PIN 6
 
 // I2C Pins
@@ -49,10 +74,100 @@ uint64_t last_peak_time = 0;
 uint8_t ssd[ssd1306_buffer_length];
 struct render_area frame_area;
 
-// Global Variables
-int send_message_clear = 0;
 volatile uint64_t last_press_time_b = 0;
 volatile uint64_t last_mic_infraction_send_time = 0;
+
+// Joystick Configuration
+#define JOY_ADC_MAX 4095 // 12-bit ADC
+#define JOY_CENTER (JOY_ADC_MAX / 2)
+#define JOY_DEAD_ZONE 600 // ± dead band around centre
+#define JOY_REPEAT_MS 200 // cursor repeat rate
+#define JOY_Y_ADC_CHANNEL 0
+#define JOY_X_ADC_CHANNEL 1
+#define JOY_X_ADC_PIN (26 + JOY_X_ADC_CHANNEL)
+#define JOY_Y_ADC_PIN (26 + JOY_Y_ADC_CHANNEL)
+
+// Cursor position helpers
+static uint8_t row_of(uint8_t idx) { return idx / MATRIX_SIDE; }
+static uint8_t col_of(uint8_t idx) { return idx % MATRIX_SIDE; }
+
+static uint8_t wrap5(int v) { return (v + MATRIX_SIDE) % MATRIX_SIDE; }
+struct pixel_t
+{
+    uint8_t G, R, B; // Três valores de 8-bits compõem um pixel.
+};
+typedef struct pixel_t pixel_t;
+typedef pixel_t npLED_t; // Mudança de nome de "struct pixel_t" para "npLED_t" por clareza.
+
+// Declaração do buffer de pixels que formam a matriz.
+npLED_t leds[MATRIX_LEDS];
+
+// Variáveis para uso da máquina PIO.
+PIO np_pio;
+uint sm;
+
+static inline uint8_t scale(uint8_t v, uint8_t factor)
+{
+    return (uint16_t)v * factor / 255;
+}
+
+// Inicializa a máquina PIO para controle da matriz de LEDs.
+void npInit(uint pin)
+{
+
+    // Cria programa PIO.
+    uint offset = pio_add_program(pio0, &ws2818b_program);
+    np_pio = pio0;
+
+    // Toma posse de uma máquina PIO.
+    sm = pio_claim_unused_sm(np_pio, false);
+    if (sm < 0)
+    {
+        np_pio = pio1;
+        sm = pio_claim_unused_sm(np_pio, true); // Se nenhuma máquina estiver livre, panic!
+    }
+
+    // Inicia programa na máquina PIO obtida.
+    ws2818b_program_init(np_pio, sm, offset, pin, 800000.f);
+
+    // Limpa buffer de pixels.
+    for (uint i = 0; i < MATRIX_LEDS; ++i)
+    {
+        leds[i].R = 0;
+        leds[i].G = 0;
+        leds[i].B = 0;
+    }
+}
+
+// Atribui uma cor RGB a um LED.
+void npSetLED(const uint index, const uint8_t r, const uint8_t g, const uint8_t b)
+{
+    leds[index].R = scale(r, global_brightness);
+    leds[index].G = scale(g, global_brightness);
+    leds[index].B = scale(b, global_brightness);
+}
+
+// Limpa o buffer de pixels.
+void npClear()
+{
+    for (uint i = 0; i < MATRIX_LEDS; ++i)
+        npSetLED(i, 0, 0, 0);
+}
+
+/**
+ * Escreve os dados do buffer nos LEDs.
+ */
+void npWrite()
+{
+    // Escreve cada dado de 8-bits dos pixels em sequência no buffer da máquina PIO.
+    for (uint i = 0; i < MATRIX_LEDS; ++i)
+    {
+        pio_sm_put_blocking(np_pio, sm, leds[i].G);
+        pio_sm_put_blocking(np_pio, sm, leds[i].R);
+        pio_sm_put_blocking(np_pio, sm, leds[i].B);
+    }
+    sleep_us(100); // Espera 100us, sinal de RESET do datasheet.
+}
 
 // MQTT Client
 mqtt_client_t *mqtt_client;
@@ -68,11 +183,75 @@ static const struct mqtt_connect_client_info_t mqtt_client_info = {
     .will_qos = 0                    // Last will QoS level
 };
 
+// Matrix helpers
+void draw_matrix(void)
+{
+    for (int i = 0; i < MATRIX_LEDS; ++i)
+    {
+        if (i == cursor_idx)
+            npSetLED(i, 0, 0, 255); // blue cursor
+        else if (led_on[i])
+            npSetLED(i, 255, 255, 255); // white
+        else
+            npSetLED(i, 0, 0, 0); // off
+    }
+    npWrite(); // push to the LEDs
+}
+
+static bool all_leds_on(void)
+{
+    for (int i = 0; i < MATRIX_LEDS; ++i)
+        if (!led_on[i])
+            return false;
+    return true;
+}
+
+static void clear_matrix(void)
+{
+    npClear();
+    npWrite();
+}
+
+// Function to start a new level in the game
+void start_level(uint8_t lvl)
+{
+    memset(led_on, true, sizeof led_on);
+    led_on[MID_IDX] = true;
+
+    uint8_t to_turn_off = (2 * lvl - 1);
+    if (to_turn_off > MATRIX_LEDS - 1)
+        to_turn_off = MATRIX_LEDS - 1;
+
+    // randomly blank LEDs (never the centre)
+    while (to_turn_off)
+    {
+        uint8_t r = rand() % MATRIX_LEDS;
+        if (r == MID_IDX || !led_on[r])
+            continue;
+        led_on[r] = false;
+        --to_turn_off;
+    }
+
+    cursor_idx = MID_IDX;
+    draw_matrix();
+}
+
+// Function to activate the cursor
+void try_activate_square()
+{
+    if (!led_on[cursor_idx])
+    {
+        led_on[cursor_idx] = true;
+        draw_matrix();
+    }
+}
+
+// Function to check if the number of peaks in the last 10 seconds is sufficient
 bool peaks_in_window(uint64_t now_ms)
 {
     if (peak_count < REQUIRED_PEAKS)
         return false;
-    // Índice do pico mais antigo no buffer circular
+    // The index of the oldest peak in the circular buffer
     uint8_t oldest = (peak_index + (REQUIRED_PEAKS - peak_count)) % REQUIRED_PEAKS;
     return (now_ms - peak_times[oldest]) <= WINDOW_MS;
 }
@@ -225,16 +404,132 @@ void gpio_callback(uint gpio, uint32_t events)
 {
     uint64_t current_time = to_ms_since_boot(get_absolute_time());
 
-    if (gpio == BTN_B_PIN && current_time - last_press_time_b > 200 && send_message_clear == 0)
+    if (gpio == BTN_B_PIN && current_time - last_press_time_b > 200)
     { // Debounce Button B
         last_press_time_b = current_time;
-        send_message_clear = 1;
+        if (current_mode == MODE_CHALLENGE)
+        {
+            try_activate_square();
+        }
+    }
+}
+
+/* ----------------------------------------------------
+ *  Reads joystick and moves the blue cursor if needed
+ * --------------------------------------------------*/
+void handle_joystick(void)
+{
+    static uint64_t last_move_ms = 0;
+    uint64_t now_ms = to_ms_since_boot(get_absolute_time());
+    if (now_ms - last_move_ms < JOY_REPEAT_MS)
+        return; // throttle
+
+    /* ---- read X & Y ---------------------------------- */
+    adc_select_input(JOY_X_ADC_CHANNEL);
+    uint16_t adc_x = adc_read(); // X on ADC1 / GPIO27
+    adc_select_input(JOY_Y_ADC_CHANNEL);
+    uint16_t adc_y = adc_read(); // Y on ADC0 / GPIO26
+
+    printf("X: %d, Y: %d\n", adc_x, adc_y);
+
+    int dx = 0, dy = 0;
+
+    if (adc_x > JOY_CENTER + JOY_DEAD_ZONE)
+        dx = +1; // right
+    else if (adc_x < JOY_CENTER - JOY_DEAD_ZONE)
+        dx = -1; // left
+
+    if (adc_y > JOY_CENTER + JOY_DEAD_ZONE)
+        dy = -1; // down  (Y increases == stick down)
+    else if (adc_y < JOY_CENTER - JOY_DEAD_ZONE)
+        dy = +1; // up
+
+    if (!dx && !dy)
+        return; // inside dead-zone → no move
+
+    /* ---- convert to new cursor index ----------------- */
+    uint8_t row = row_of(cursor_idx);
+    uint8_t col = col_of(cursor_idx);
+
+    row = wrap5(row + dy);
+    col = wrap5(col + dx);
+
+    uint8_t new_idx = row * MATRIX_SIDE + col;
+
+    /* ---- ignore centre square unless you want to allow it ---- */
+    if (new_idx == MID_IDX)
+        return;
+
+    /* ---- update & redraw ------------------------------------ */
+    if (new_idx != cursor_idx)
+    {
+        cursor_idx = new_idx;
+        last_move_ms = now_ms;
+        draw_matrix();
+    }
+}
+
+void listening_mode()
+{
+    uint64_t now_ms = to_ms_since_boot(get_absolute_time());
+    adc_select_input(MIC_ADC_CHANNEL);
+    uint16_t adc_value = adc_read();
+
+    printf("ADC Value: %d\n", adc_value);
+    if (adc_value > MIC_THRESHOLD)
+    {
+        last_peak_time = now_ms;
+
+        peak_times[peak_index] = now_ms;
+        peak_index = (peak_index + 1) % REQUIRED_PEAKS;
+        if (peak_count < REQUIRED_PEAKS)
+            peak_count++;
+
+        if (peaks_in_window(now_ms) && (now_ms - last_mic_infraction_send_time) > INFRACTION_SEND_COOLDOWN_MS)
+        {
+            printf("Infraction detected! ADC Value: %d\n", adc_value);
+            mqtt_send_message(mqtt_client, MQTT_TOPIC_INFRACTION, "Infraction detected!");
+            display_message("Infraction detected!");
+            last_mic_infraction_send_time = now_ms;
+            current_mode = MODE_CHALLENGE;
+            start_level(level);
+            peak_count = 0;
+        }
+    }
+    else if (peak_count > 0 && (now_ms - last_peak_time) > SILENCE_RESET_MS)
+    {
+        peak_count = 0;
+    }
+}
+
+void challenge_mode()
+{
+    uint64_t now_ms = to_ms_since_boot(get_absolute_time());
+
+    printf("Challenge Mode: Level %d\n", level);
+
+    if (all_leds_on())
+    {
+        if (now_ms - last_reset_ms > 60 * 60 * 1000) // 1 hour
+        {
+            level = 1;
+            last_reset_ms = now_ms;
+        }
+        else if (level < MAX_LEVELS)
+        {
+            ++level;
+        }
+
+        mqtt_send_message(mqtt_client, MQTT_TOPIC_CLEAR, "Clear!");
+        current_mode = MODE_LISTENING;
+        clear_matrix();
     }
 }
 
 int main()
 {
     stdio_init_all();
+    npInit(WS_PIN);
 
     // Initialize Leds and Buttons
     gpio_init(LED_R_PIN);
@@ -250,6 +545,8 @@ int main()
 
     // Initialize ADC
     adc_gpio_init(MIC_ADC_PIN);
+    adc_gpio_init(JOY_X_ADC_PIN);
+    adc_gpio_init(JOY_Y_ADC_PIN);
     adc_init();
     adc_select_input(MIC_ADC_CHANNEL);
 
@@ -273,37 +570,17 @@ int main()
         // Poll the Wi-Fi chip
         cyw43_arch_poll();
 
-        uint64_t now_ms = to_ms_since_boot(get_absolute_time());
-        uint16_t adc_value = adc_read();
-
-        if (adc_value > MIC_THRESHOLD)
+        switch (current_mode)
         {
-            last_peak_time = now_ms;
 
-            peak_times[peak_index] = now_ms;
-            peak_index = (peak_index + 1) % REQUIRED_PEAKS;
-            if (peak_count < REQUIRED_PEAKS)
-                peak_count++;
+        case MODE_LISTENING:
+            listening_mode();
+            break;
 
-            if (peaks_in_window(now_ms) && (now_ms - last_mic_infraction_send_time) > INFRACTION_SEND_COOLDOWN_MS)
-            {
-                last_mic_infraction_send_time = now_ms;
-                printf("Infraction detected! ADC Value: %d\n", adc_value);
-                mqtt_send_message(mqtt_client, MQTT_TOPIC_INFRACTION, "Infraction detected!");
-                display_message("Infraction detected!");
-                peak_count = 0;
-            }
-        }
-        else if (peak_count > 0 && (now_ms - last_peak_time) > SILENCE_RESET_MS)
-        {
-            peak_count = 0;
-        }
-
-        if (send_message_clear)
-        {
-            send_message_clear = 0;
-            mqtt_send_message(mqtt_client, MQTT_TOPIC_CLEAR, "Clear!");
-            display_message("Clear!");
+        case MODE_CHALLENGE:
+            handle_joystick();
+            challenge_mode();
+            break;
         }
 
         // Reduce CPU usage
