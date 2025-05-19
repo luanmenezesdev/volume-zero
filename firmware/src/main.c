@@ -28,18 +28,20 @@ volatile app_mode_t current_mode = MODE_LISTENING;
 #define MATRIX_SIDE 5
 #define MATRIX_LEDS 25
 #define MID_IDX 12
-uint8_t global_brightness = 64;
+uint8_t global_brightness = 32;
 
 uint8_t level = 1;
 static uint64_t last_reset_ms = 0;
 bool led_on[MATRIX_LEDS];
-uint8_t cursor_idx = MID_IDX;
+uint8_t cursor_row = 2;
+uint8_t cursor_col = 2;
+uint8_t activate_led = 0;
 
 // Wi-Fi Credentials
-// #define WIFI_SSID "brisa-4370576"
-// #define WIFI_PASSWORD "mmy6opmr"
-#define WIFI_SSID "Redmi Note 12"
-#define WIFI_PASSWORD "luanteste"
+#define WIFI_SSID "brisa-4370576"
+#define WIFI_PASSWORD "mmy6opmr"
+// #define WIFI_SSID "Redmi Note 12"
+// #define WIFI_PASSWORD "luanteste"
 
 // MQTT Configuration
 #define MQTT_BROKER "52.28.107.34"
@@ -88,8 +90,23 @@ volatile uint64_t last_mic_infraction_send_time = 0;
 #define JOY_Y_ADC_PIN (26 + JOY_Y_ADC_CHANNEL)
 
 // Cursor position helpers
-static uint8_t row_of(uint8_t idx) { return idx / MATRIX_SIDE; }
-static uint8_t col_of(uint8_t idx) { return idx % MATRIX_SIDE; }
+static inline uint8_t rc_to_idx(uint8_t row, uint8_t col)
+{
+    /* a matrixa real tem a primeira fileira no topo,
+       mas o seu cabeamento começa no rodapé (row 4). */
+    uint8_t hw_row = MATRIX_SIDE - 1 - row; // espelha verticalmente
+
+    if (hw_row & 1)
+    {
+        /* fileiras ímpares (contando 0-based) vão da esquerda→direita */
+        return hw_row * MATRIX_SIDE + col;
+    }
+    else
+    {
+        /* fileiras pares vão da direita→esquerda */
+        return hw_row * MATRIX_SIDE + (MATRIX_SIDE - 1 - col);
+    }
+}
 
 static uint8_t wrap5(int v) { return (v + MATRIX_SIDE) % MATRIX_SIDE; }
 struct pixel_t
@@ -109,6 +126,21 @@ uint sm;
 static inline uint8_t scale(uint8_t v, uint8_t factor)
 {
     return (uint16_t)v * factor / 255;
+}
+
+/**
+ * Escreve os dados do buffer nos LEDs.
+ */
+void npWrite()
+{
+    // Escreve cada dado de 8-bits dos pixels em sequência no buffer da máquina PIO.
+    for (uint i = 0; i < MATRIX_LEDS; ++i)
+    {
+        pio_sm_put_blocking(np_pio, sm, leds[i].G);
+        pio_sm_put_blocking(np_pio, sm, leds[i].R);
+        pio_sm_put_blocking(np_pio, sm, leds[i].B);
+    }
+    sleep_us(100); // Espera 100us, sinal de RESET do datasheet.
 }
 
 // Inicializa a máquina PIO para controle da matriz de LEDs.
@@ -137,6 +169,7 @@ void npInit(uint pin)
         leds[i].G = 0;
         leds[i].B = 0;
     }
+    npWrite();
 }
 
 // Atribui uma cor RGB a um LED.
@@ -152,21 +185,6 @@ void npClear()
 {
     for (uint i = 0; i < MATRIX_LEDS; ++i)
         npSetLED(i, 0, 0, 0);
-}
-
-/**
- * Escreve os dados do buffer nos LEDs.
- */
-void npWrite()
-{
-    // Escreve cada dado de 8-bits dos pixels em sequência no buffer da máquina PIO.
-    for (uint i = 0; i < MATRIX_LEDS; ++i)
-    {
-        pio_sm_put_blocking(np_pio, sm, leds[i].G);
-        pio_sm_put_blocking(np_pio, sm, leds[i].R);
-        pio_sm_put_blocking(np_pio, sm, leds[i].B);
-    }
-    sleep_us(100); // Espera 100us, sinal de RESET do datasheet.
 }
 
 // MQTT Client
@@ -186,16 +204,19 @@ static const struct mqtt_connect_client_info_t mqtt_client_info = {
 // Matrix helpers
 void draw_matrix(void)
 {
-    for (int i = 0; i < MATRIX_LEDS; ++i)
-    {
-        if (i == cursor_idx)
-            npSetLED(i, 0, 0, 255); // blue cursor
-        else if (led_on[i])
-            npSetLED(i, 255, 255, 255); // white
-        else
-            npSetLED(i, 0, 0, 0); // off
-    }
-    npWrite(); // push to the LEDs
+    for (int r = 0; r < MATRIX_SIDE; ++r)
+        for (int c = 0; c < MATRIX_SIDE; ++c)
+        {
+            uint8_t idx = rc_to_idx(r, c);
+
+            if (r == cursor_row && c == cursor_col)
+                npSetLED(idx, 0, 0, 255); // azul
+            else if (led_on[idx])
+                npSetLED(idx, 255, 255, 255); // branco
+            else
+                npSetLED(idx, 0, 0, 0); // apagado
+        }
+    npWrite();
 }
 
 static bool all_leds_on(void)
@@ -232,16 +253,17 @@ void start_level(uint8_t lvl)
         --to_turn_off;
     }
 
-    cursor_idx = MID_IDX;
+    cursor_row = 2;
+    cursor_col = 2;
     draw_matrix();
 }
 
 // Function to activate the cursor
 void try_activate_square()
 {
-    if (!led_on[cursor_idx])
+    if (!led_on[rc_to_idx(cursor_row, cursor_col)])
     {
-        led_on[cursor_idx] = true;
+        led_on[rc_to_idx(cursor_row, cursor_col)] = true;
         draw_matrix();
     }
 }
@@ -409,7 +431,7 @@ void gpio_callback(uint gpio, uint32_t events)
         last_press_time_b = current_time;
         if (current_mode == MODE_CHALLENGE)
         {
-            try_activate_square();
+            activate_led = 1;
         }
     }
 }
@@ -422,51 +444,34 @@ void handle_joystick(void)
     static uint64_t last_move_ms = 0;
     uint64_t now_ms = to_ms_since_boot(get_absolute_time());
     if (now_ms - last_move_ms < JOY_REPEAT_MS)
-        return; // throttle
-
-    /* ---- read X & Y ---------------------------------- */
-    adc_select_input(JOY_X_ADC_CHANNEL);
-    uint16_t adc_x = adc_read(); // X on ADC1 / GPIO27
-    adc_select_input(JOY_Y_ADC_CHANNEL);
-    uint16_t adc_y = adc_read(); // Y on ADC0 / GPIO26
-
-    printf("X: %d, Y: %d\n", adc_x, adc_y);
-
-    int dx = 0, dy = 0;
-
-    if (adc_x > JOY_CENTER + JOY_DEAD_ZONE)
-        dx = +1; // right
-    else if (adc_x < JOY_CENTER - JOY_DEAD_ZONE)
-        dx = -1; // left
-
-    if (adc_y > JOY_CENTER + JOY_DEAD_ZONE)
-        dy = -1; // down  (Y increases == stick down)
-    else if (adc_y < JOY_CENTER - JOY_DEAD_ZONE)
-        dy = +1; // up
-
-    if (!dx && !dy)
-        return; // inside dead-zone → no move
-
-    /* ---- convert to new cursor index ----------------- */
-    uint8_t row = row_of(cursor_idx);
-    uint8_t col = col_of(cursor_idx);
-
-    row = wrap5(row + dy);
-    col = wrap5(col + dx);
-
-    uint8_t new_idx = row * MATRIX_SIDE + col;
-
-    /* ---- ignore centre square unless you want to allow it ---- */
-    if (new_idx == MID_IDX)
         return;
 
-    /* ---- update & redraw ------------------------------------ */
-    if (new_idx != cursor_idx)
-    {
-        cursor_idx = new_idx;
-        last_move_ms = now_ms;
-        draw_matrix();
-    }
+    /* ler joystick ------------------------------------------------ */
+    adc_select_input(JOY_X_ADC_CHANNEL);
+    uint16_t adc_x = adc_read();
+    adc_select_input(JOY_Y_ADC_CHANNEL);
+    uint16_t adc_y = adc_read();
+
+    int dx = 0, dy = 0;
+    if (adc_x > JOY_CENTER + JOY_DEAD_ZONE)
+        dx = +1;
+    else if (adc_x < JOY_CENTER - JOY_DEAD_ZONE)
+        dx = -1;
+
+    if (adc_y > JOY_CENTER + JOY_DEAD_ZONE)
+        dy = -1; // stick desce → cursor desce
+    else if (adc_y < JOY_CENTER - JOY_DEAD_ZONE)
+        dy = +1; // stick sobe  → cursor sobe
+
+    if (!dx && !dy)
+        return;
+
+    /* calcular novo row/col --------------------------------------- */
+    cursor_row = wrap5(cursor_row + dy);
+    cursor_col = wrap5(cursor_col + dx);
+
+    last_move_ms = now_ms;
+    draw_matrix();
 }
 
 void listening_mode()
@@ -506,7 +511,13 @@ void challenge_mode()
 {
     uint64_t now_ms = to_ms_since_boot(get_absolute_time());
 
-    printf("Challenge Mode: Level %d\n", level);
+    printf("Challenge Mode: LED %d\n", rc_to_idx(cursor_row, cursor_col));
+
+    if (activate_led)
+    {
+        activate_led = 0;
+        try_activate_square();
+    }
 
     if (all_leds_on())
     {
@@ -530,6 +541,8 @@ int main()
 {
     stdio_init_all();
     npInit(WS_PIN);
+
+    srand((unsigned)time_us_64());
 
     // Initialize Leds and Buttons
     gpio_init(LED_R_PIN);
