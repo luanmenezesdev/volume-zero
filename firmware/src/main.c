@@ -392,33 +392,20 @@ void init_oled()
     render_on_display(ssd, &frame_area);
 }
 
-void display_message(char *message)
+void display_message(char *lines[], int line_count)
 {
-    // Constants for the display
-    const int max_chars_per_line = ssd1306_width / 8.5; // Assuming each character is ~8.5px wide
-    const int max_lines = ssd1306_n_pages;              // Number of lines (pages) on the display
-
-    // Buffer to store one line of text
-    char line_buffer[max_chars_per_line + 1];
-
-    // Clear the display buffer
+    // Limpa o buffer
     memset(ssd, 0, ssd1306_buffer_length);
 
-    // Split the message into lines and render each
-    for (int line = 0; line < max_lines && *message != '\0'; ++line)
+    // Desenha cada linha
+    for (int i = 0; i < line_count; i++)
     {
-        // Copy up to `max_chars_per_line` characters to the line buffer
-        strncpy(line_buffer, message, max_chars_per_line);
-        line_buffer[max_chars_per_line] = '\0'; // Ensure null-termination
-
-        // Draw the current line
-        ssd1306_draw_string(ssd, 5, line * 8, line_buffer); // Y-offset: line * 8px
-
-        // Move the pointer in the message to the next chunk
-        message += max_chars_per_line;
+        if (lines[i] != NULL)
+        {
+            ssd1306_draw_string(ssd, 5, i * 8, lines[i]);
+        }
     }
 
-    // Render the updated buffer on the display
     render_on_display(ssd, &frame_area);
 }
 
@@ -492,9 +479,14 @@ void listening_mode()
 
         if (peaks_in_window(now_ms) && (now_ms - last_mic_infraction_send_time) > INFRACTION_SEND_COOLDOWN_MS)
         {
-            printf("Infraction detected! ADC Value: %d\n", adc_value);
             mqtt_send_message(mqtt_client, MQTT_TOPIC_INFRACTION, "Infraction detected!");
-            display_message("Infraction detected!");
+            display_message((char *[]){
+                                "infraction",
+                                "detected",
+                                "",
+                                "complete the",
+                                "challenge"},
+                            5);
             last_mic_infraction_send_time = now_ms;
             current_mode = MODE_CHALLENGE;
             start_level(level);
@@ -531,6 +523,10 @@ void challenge_mode()
             ++level;
         }
 
+        display_message((char *[]){
+                            "Listening Mode",
+                        },
+                        1);
         mqtt_send_message(mqtt_client, MQTT_TOPIC_CLEAR, "Clear!");
         current_mode = MODE_LISTENING;
         clear_matrix();
@@ -539,7 +535,7 @@ void challenge_mode()
 
 int main()
 {
-    stdio_init_all();
+    stdio_usb_init();
     npInit(WS_PIN);
 
     srand((unsigned)time_us_64());
@@ -577,6 +573,11 @@ int main()
     connect_to_wifi();
 
     init_mqtt();
+
+    display_message((char *[]){
+                        "Listening Mode",
+                    },
+                    1);
 
     while (true)
     {
