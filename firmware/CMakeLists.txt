@@ -67,6 +67,7 @@ target_link_libraries(
         hardware_gpio
         hardware_i2c
         hardware_irq
+        hardware_adc
 )
 
 pico_add_extra_outputs(volume-zero)

@@ -6,6 +6,7 @@
 #include "pico/binary_info.h"
 #include "ssd1306.h"
 #include "hardware/i2c.h"
+#include "hardware/adc.h"
 #include "pico/cyw43_arch.h"
 #include "lwip/apps/mqtt.h"
 #include "lwip/ip_addr.h"
@@ -19,11 +20,29 @@
 #define MQTT_TOPIC_INFRACTION "volume/infraction"
 #define MQTT_TOPIC_CLEAR "volume/clear"
 
+// Microphone Configuration
+#define INFRACTION_SEND_COOLDOWN_MS 3000
+#define MIC_THRESHOLD 2100
+#define REQUIRED_PEAKS 5
+#define WINDOW_MS 10000
+#define SILENCE_RESET_MS 5000
+#define MIC_ADC_CHANNEL 2
+#define MIC_ADC_PIN (26 + MIC_ADC_CHANNEL)
+
+//  Keeps track of the peaks
+uint64_t peak_times[REQUIRED_PEAKS];
+uint8_t peak_index = 0;
+uint8_t peak_count = 0;
+
+uint64_t last_peak_time = 0;
+
+// LED and Button Pins
 #define LED_R_PIN 13
 #define LED_G_PIN 11
 #define BTN_A_PIN 5
 #define BTN_B_PIN 6
 
+// I2C Pins
 #define I2C_SDA_PIN 14
 #define I2C_SCL_PIN 15
 
@@ -31,10 +50,9 @@ uint8_t ssd[ssd1306_buffer_length];
 struct render_area frame_area;
 
 // Global Variables
-int send_message_infraction = 0;
 int send_message_clear = 0;
-volatile uint64_t last_press_time_a = 0;
 volatile uint64_t last_press_time_b = 0;
+volatile uint64_t last_mic_infraction_send_time = 0;
 
 // MQTT Client
 mqtt_client_t *mqtt_client;
@@ -49,6 +67,15 @@ static const struct mqtt_connect_client_info_t mqtt_client_info = {
     .will_retain = 0,                // Last will retain flag
     .will_qos = 0                    // Last will QoS level
 };
+
+bool peaks_in_window(uint64_t now_ms)
+{
+    if (peak_count < REQUIRED_PEAKS)
+        return false;
+    // Índice do pico mais antigo no buffer circular
+    uint8_t oldest = (peak_index + (REQUIRED_PEAKS - peak_count)) % REQUIRED_PEAKS;
+    return (now_ms - peak_times[oldest]) <= WINDOW_MS;
+}
 
 // Function to send a message via MQTT
 void mqtt_send_message(mqtt_client_t *client, const char *mqtt_topic, const char *message)
@@ -198,12 +225,6 @@ void gpio_callback(uint gpio, uint32_t events)
 {
     uint64_t current_time = to_ms_since_boot(get_absolute_time());
 
-    if (gpio == BTN_A_PIN && current_time - last_press_time_a > 200 && send_message_infraction == 0)
-    { // Debounce Button A
-        last_press_time_a = current_time;
-        send_message_infraction = 1;
-    }
-
     if (gpio == BTN_B_PIN && current_time - last_press_time_b > 200 && send_message_clear == 0)
     { // Debounce Button B
         last_press_time_b = current_time;
@@ -221,16 +242,16 @@ int main()
     gpio_init(LED_G_PIN);
     gpio_set_dir(LED_G_PIN, GPIO_OUT);
 
-    gpio_init(BTN_A_PIN);
-    gpio_set_dir(BTN_A_PIN, GPIO_IN);
-    gpio_pull_up(BTN_A_PIN);
     gpio_init(BTN_B_PIN);
     gpio_set_dir(BTN_B_PIN, GPIO_IN);
     gpio_pull_up(BTN_B_PIN);
 
-    // Set Shared GPIO Interrupt
-    gpio_set_irq_enabled_with_callback(BTN_A_PIN, GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
-    gpio_set_irq_enabled(BTN_B_PIN, GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_enabled_with_callback(BTN_B_PIN, GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
+
+    // Initialize ADC
+    adc_gpio_init(MIC_ADC_PIN);
+    adc_init();
+    adc_select_input(MIC_ADC_CHANNEL);
 
     init_oled();
 
@@ -252,11 +273,30 @@ int main()
         // Poll the Wi-Fi chip
         cyw43_arch_poll();
 
-        if (send_message_infraction)
+        uint64_t now_ms = to_ms_since_boot(get_absolute_time());
+        uint16_t adc_value = adc_read();
+
+        if (adc_value > MIC_THRESHOLD)
         {
-            send_message_infraction = 0;
-            mqtt_send_message(mqtt_client, MQTT_TOPIC_INFRACTION, "Infraction detected!");
-            display_message("Infraction detected!");
+            last_peak_time = now_ms;
+
+            peak_times[peak_index] = now_ms;
+            peak_index = (peak_index + 1) % REQUIRED_PEAKS;
+            if (peak_count < REQUIRED_PEAKS)
+                peak_count++;
+
+            if (peaks_in_window(now_ms) && (now_ms - last_mic_infraction_send_time) > INFRACTION_SEND_COOLDOWN_MS)
+            {
+                last_mic_infraction_send_time = now_ms;
+                printf("Infraction detected! ADC Value: %d\n", adc_value);
+                mqtt_send_message(mqtt_client, MQTT_TOPIC_INFRACTION, "Infraction detected!");
+                display_message("Infraction detected!");
+                peak_count = 0;
+            }
+        }
+        else if (peak_count > 0 && (now_ms - last_peak_time) > SILENCE_RESET_MS)
+        {
+            peak_count = 0;
         }
 
         if (send_message_clear)
