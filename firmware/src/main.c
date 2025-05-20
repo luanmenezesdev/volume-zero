@@ -38,10 +38,10 @@ uint8_t cursor_col = 2;
 uint8_t activate_led = 0;
 
 // Wi-Fi Credentials
-#define WIFI_SSID "brisa-4370576"
-#define WIFI_PASSWORD "mmy6opmr"
-// #define WIFI_SSID "Redmi Note 12"
-// #define WIFI_PASSWORD "luanteste"
+// #define WIFI_SSID "brisa-4370576"
+// #define WIFI_PASSWORD "mmy6opmr"
+#define WIFI_SSID "Redmi Note 12"
+#define WIFI_PASSWORD "luanteste"
 
 // MQTT Configuration
 #define MQTT_BROKER "52.28.107.34"
@@ -210,7 +210,7 @@ void draw_matrix(void)
             uint8_t idx = rc_to_idx(r, c);
 
             if (r == cursor_row && c == cursor_col)
-                npSetLED(idx, 0, 0, 255); // azul
+                npSetLED(idx, 255, 0, 0); // vermelho
             else if (led_on[idx])
                 npSetLED(idx, 255, 255, 255); // branco
             else
